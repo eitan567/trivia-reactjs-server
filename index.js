@@ -8,7 +8,7 @@ const server = http.createServer(app);
 
 const io = socketIo(server, {
   cors: {
-    origin: "http://84.229.242.33:3000",
+    origin: "http://176.231.157.72:3000",
     methods: ["GET", "POST"],
     allowedHeaders: ["Authorization"],
     credentials: true,
