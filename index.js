@@ -30,6 +30,45 @@ function shuffleArray(array) {
 io.on('connection', (socket) => {
   console.log('New client connected');
 
+  socket.on('restartGame', (gameCode) => {
+    const game = games[gameCode];
+    if (game && game.state === 'finished') {
+      game.state = 'waiting';
+      game.currentPlayerIndex = 0;
+      game.currentQuestionIndex = -1;
+      game.players.forEach(player => player.score = 0);
+
+      const totalQuestions = game.questionsPerGame * game.players.length;
+      db.all(
+        `SELECT * FROM Questions ORDER BY RANDOM() LIMIT ?`,
+        [totalQuestions],
+        (err, questions) => {
+          if (err) return console.error(err.message);
+
+          shuffleArray(questions);
+          game.questions = questions;
+          game.totalQuestions = totalQuestions;
+
+          console.log(`Fetched ${questions.length} questions for ${game.players.length} players`);
+
+          io.to(gameCode).emit('gameRestarted');
+          io.to(gameCode).emit('gameState', 'waiting');
+          io.to(gameCode).emit('playerList', game.players);
+        }
+      );
+    } else {
+      console.log('Game not found or not in finished state');
+    }
+  });
+
+  // Modify the leaveGame function to handle finished games
+  socket.on('leaveGame', () => {
+    const gameCode = Object.keys(games).find(key => games[key].players.some(p => p.id === socket.id));
+    if (gameCode) {
+      leaveGame(socket, gameCode);
+    }
+  });
+
   socket.on('createGame', ({ gameCode, playerName }) => {
     if (games[gameCode]) {
       socket.emit('gameCreationError', 'קוד משחק זה כבר קיים. אנא בחר קוד אחר.');
@@ -253,7 +292,8 @@ function endGame(gameCode) {
   game.state = 'finished';
   io.to(gameCode).emit('gameState', 'finished');
   clearTimeout(game.timer);
-  delete games[gameCode];
+  // Instead of deleting the game, we'll keep it and mark it as finished
+  // delete games[gameCode];
 }
 
 app.get('/', (req, res) => {
