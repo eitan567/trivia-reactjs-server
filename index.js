@@ -1,14 +1,16 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const questions = require('./questions.json');
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+
+const db = new sqlite3.Database('./trivia.db');
 
 const app = express();
 const server = http.createServer(app);
-
 const io = socketIo(server, {
   cors: {
-    origin: "http://176.231.157.72:3000",
+    origin: "http://84.229.242.33:3000",
     methods: ["GET", "POST"],
     allowedHeaders: ["Authorization"],
     credentials: true,
@@ -25,27 +27,63 @@ io.on('connection', (socket) => {
     if (games[gameCode]) {
       socket.emit('gameCreationError', 'קוד משחק זה כבר קיים. אנא בחר קוד אחר.');
     } else {
-      games[gameCode] = {
-        players: [{ id: socket.id, name: playerName, score: 0 }],
-        currentPlayerIndex: 0,
-        currentQuestionIndex: 0,
-        state: 'waiting',
-        timer: null
-      };
-      socket.join(gameCode);
-      socket.emit('gameCreated', gameCode);
-      io.to(gameCode).emit('gameState', 'waiting');
-      io.to(gameCode).emit('playerList', games[gameCode].players);
+      db.get(
+        `SELECT value FROM Settings WHERE key = 'maxPlayersPerGame'`,
+        (err, row) => {
+          if (err) return console.error(err.message);
+          const maxPlayers = parseInt(row.value, 10);
+  
+          games[gameCode] = {
+            players: [{ id: socket.id, name: playerName, score: 0 }],
+            currentPlayerIndex: 0,
+            currentQuestionIndex: -1,
+            state: 'waiting',
+            timer: null,
+            maxPlayers: maxPlayers,
+            timePerQuestion: '10000',
+            questionsPerGame: 10
+          };
+  
+          db.get(
+            `SELECT value FROM Settings WHERE key = 'timePerQuestion'`,
+            (err, row) => {
+              if (!err && row) {
+                games[gameCode].timePerQuestion = row.value;
+              }
+            }
+          );
+          
+          db.get(
+            `SELECT value FROM Settings WHERE key = 'questionsPerGame'`,
+            (err, row) => {
+              if (!err && row) {
+                games[gameCode].questionsPerGame = parseInt(row.value, 10);
+              }
+            }
+          );
+  
+          socket.join(gameCode);
+          socket.emit('gameCreated', gameCode);
+          io.to(gameCode).emit('gameState', 'waiting');
+          io.to(gameCode).emit('playerList', games[gameCode].players);
+        }
+      );
     }
   });
 
   socket.on('joinGame', ({ gameCode, playerName }) => {
-    if (games[gameCode] && games[gameCode].state === 'waiting') {
-      games[gameCode].players.push({ id: socket.id, name: playerName, score: 0 });
+    const game = games[gameCode];
+    if (game && game.state === 'waiting') {
+      if (game.players.length >= game.maxPlayers) {
+        socket.emit('error', 'המשחק מלא. לא ניתן להצטרף.');
+        return;
+      }
+  
+      game.players.push({ id: socket.id, name: playerName, score: 0 });
       socket.join(gameCode);
       socket.emit('gameCreated', gameCode);
       io.to(gameCode).emit('gameState', 'waiting');
-      io.to(gameCode).emit('playerList', games[gameCode].players);
+      io.to(gameCode).emit('playerList', game.players);
     } else {
       socket.emit('error', 'המשחק לא נמצא או שכבר התחיל');
     }
@@ -61,17 +99,33 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('answer', (answerIndex) => {
+  socket.on('answer', (answerId) => {
     const gameCode = Object.keys(games).find(key => games[key].players.some(p => p.id === socket.id));
     const game = games[gameCode];
+  
     if (game && game.state === 'playing' && game.players[game.currentPlayerIndex].id === socket.id) {
       clearTimeout(game.timer);
-      const currentQuestion = questions[game.currentQuestionIndex];
-      if (answerIndex === currentQuestion.correctAnswer) {
-        game.players[game.currentPlayerIndex].score++;
-      }
-      io.to(gameCode).emit('playerList', game.players);
-      nextQuestion(gameCode);
+  
+      db.get(
+        `SELECT is_correct FROM Answers WHERE id = ?`,
+        [answerId],  // Directly check if the provided answerId is correct
+        (err, answer) => {
+          if (err) {
+            console.error('Error fetching the answer:', err.message);
+            return;
+          }
+  
+          if (answer && answer.is_correct) {
+            game.players[game.currentPlayerIndex].score++;
+            console.log('Correct answer! Score updated.');
+          } else {
+            console.log('Incorrect answer.');
+          }
+  
+          io.to(gameCode).emit('playerList', game.players);
+          nextQuestion(gameCode);
+        }
+      );
     }
   });
 
@@ -92,7 +146,7 @@ io.on('connection', (socket) => {
 });
 
 function leaveGame(socket, gameCode) {
-  try{
+  try {
     const game = games[gameCode];
     game.players = game.players.filter(p => p.id !== socket.id);
     socket.leave(gameCode);
@@ -106,31 +160,60 @@ function leaveGame(socket, gameCode) {
         nextQuestion(gameCode);
       }
     }
-  } catch (e){
+  } catch (e) {
     console.log(e);
   }
 }
 
 function nextQuestion(gameCode) {
   const game = games[gameCode];
-  game.currentPlayerIndex = (game.currentPlayerIndex + 1) % game.players.length;
+  
   game.currentQuestionIndex++;
 
-  if (game.currentQuestionIndex >= questions.length) {
+  if (game.currentQuestionIndex >= game.questionsPerGame) {
     endGame(gameCode);
-  } else {
-    const currentQuestion = questions[game.currentQuestionIndex];
-    const questionUpdate = {
-      question: {
-        text: currentQuestion.question,
-        answers: currentQuestion.answers
-      },
-      currentPlayer: game.players[game.currentPlayerIndex],
-      timeLeft: 10
-    };
-    io.to(gameCode).emit('questionUpdate', questionUpdate);
-    startTimer(gameCode);
+    return;
   }
+
+  game.currentPlayerIndex = (game.currentPlayerIndex + 1) % game.players.length;
+
+  db.get(
+    `SELECT * FROM Questions ORDER BY RANDOM() LIMIT 1`,
+    (err, currentQuestion) => {
+      if (err) return console.error(err.message);
+
+      if (!currentQuestion) {
+        console.error('No questions found in the database');
+        endGame(gameCode);
+        return;
+      }
+
+      db.all(
+        `SELECT id, answer_text, is_correct FROM Answers WHERE question_id = ?`,
+        [currentQuestion.id],
+        (err, answers) => {
+          if (err) return console.error(err.message);
+
+          const questionUpdate = {
+            question: {
+              text: currentQuestion.question_text,
+              answers: answers.map(answer => ({
+                id: answer.id,
+                text: answer.answer_text
+              })),
+            },
+            currentPlayer: game.players[game.currentPlayerIndex],
+            timeLeft: parseInt(game.timePerQuestion, 10) / 1000,
+            currentQuestionNumber: game.currentQuestionIndex + 1,
+            totalQuestions: game.questionsPerGame
+          };
+
+          io.to(gameCode).emit('questionUpdate', questionUpdate);
+          startTimer(gameCode);
+        }
+      );
+    }
+  );
 }
 
 function startTimer(gameCode) {
@@ -138,7 +221,7 @@ function startTimer(gameCode) {
   clearTimeout(game.timer);
   game.timer = setTimeout(() => {
     nextQuestion(gameCode);
-  }, 10000);
+  }, parseInt(game.timePerQuestion, 10));
 }
 
 function endGame(gameCode) {
