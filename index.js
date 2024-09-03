@@ -20,6 +20,13 @@ const io = socketIo(server, {
 
 const games = {};
 
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+}
+
 io.on('connection', (socket) => {
   console.log('New client connected');
 
@@ -94,8 +101,25 @@ io.on('connection', (socket) => {
     if (game) {
       game.state = 'playing';
       const gameCode = Object.keys(games).find(key => games[key] === game);
-      io.to(gameCode).emit('gameState', 'playing');
-      nextQuestion(gameCode);
+      
+      // Fetch all questions for the game
+      const totalQuestions = game.questionsPerGame * game.players.length;
+      db.all(
+        `SELECT * FROM Questions ORDER BY RANDOM() LIMIT ?`,
+        [totalQuestions],
+        (err, questions) => {
+          if (err) return console.error(err.message);
+  
+          shuffleArray(questions);
+          game.questions = questions;
+          game.totalQuestions = totalQuestions;
+  
+          console.log(`Fetched ${questions.length} questions for ${game.players.length} players`);
+  
+          io.to(gameCode).emit('gameState', 'playing');
+          nextQuestion(gameCode);
+        }
+      );
     }
   });
 
@@ -106,24 +130,35 @@ io.on('connection', (socket) => {
     if (game && game.state === 'playing' && game.players[game.currentPlayerIndex].id === socket.id) {
       clearTimeout(game.timer);
   
+      const currentQuestion = game.questions[game.currentQuestionIndex];
+  
       db.get(
-        `SELECT is_correct FROM Answers WHERE id = ?`,
-        [answerId],  // Directly check if the provided answerId is correct
-        (err, answer) => {
+        `SELECT id FROM Answers WHERE question_id = ? AND is_correct = 1`,
+        [currentQuestion.id],
+        (err, correctAnswer) => {
           if (err) {
-            console.error('Error fetching the answer:', err.message);
+            console.error('Error fetching the correct answer:', err.message);
             return;
           }
   
-          if (answer && answer.is_correct) {
-            game.players[game.currentPlayerIndex].score++;
-            console.log('Correct answer! Score updated.');
-          } else {
-            console.log('Incorrect answer.');
-          }
+          if (correctAnswer) {
+            const isCorrect = answerId === correctAnswer.id;
+            
+            if (isCorrect) {
+              game.players[game.currentPlayerIndex].score++;
+              console.log('Correct answer! Score updated.');
+            } else {
+              console.log('Incorrect answer.');
+            }
   
-          io.to(gameCode).emit('playerList', game.players);
-          nextQuestion(gameCode);
+            console.log(`Player answered with ID: ${answerId}, Correct answer ID: ${correctAnswer.id}`);
+  
+            io.to(gameCode).emit('playerList', game.players);
+            nextQuestion(gameCode);
+          } else {
+            console.error('No correct answer found for the current question');
+            nextQuestion(gameCode);
+          }
         }
       );
     }
@@ -170,48 +205,37 @@ function nextQuestion(gameCode) {
   
   game.currentQuestionIndex++;
 
-  if (game.currentQuestionIndex >= game.questionsPerGame) {
+  if (game.currentQuestionIndex >= game.totalQuestions) {
     endGame(gameCode);
     return;
   }
 
   game.currentPlayerIndex = (game.currentPlayerIndex + 1) % game.players.length;
 
-  db.get(
-    `SELECT * FROM Questions ORDER BY RANDOM() LIMIT 1`,
-    (err, currentQuestion) => {
+  const currentQuestion = game.questions[game.currentQuestionIndex];
+
+  db.all(
+    `SELECT id, answer_text, is_correct FROM Answers WHERE question_id = ? ORDER BY RANDOM()`,
+    [currentQuestion.id],
+    (err, answers) => {
       if (err) return console.error(err.message);
 
-      if (!currentQuestion) {
-        console.error('No questions found in the database');
-        endGame(gameCode);
-        return;
-      }
+      const questionUpdate = {
+        question: {
+          text: currentQuestion.question_text,
+          answers: answers.map(answer => ({
+            id: answer.id,
+            text: answer.answer_text
+          })),
+        },
+        currentPlayer: game.players[game.currentPlayerIndex],
+        timeLeft: parseInt(game.timePerQuestion, 10) / 1000,
+        currentQuestionNumber: Math.floor(game.currentQuestionIndex / game.players.length) + 1,
+        totalQuestions: game.questionsPerGame
+      };
 
-      db.all(
-        `SELECT id, answer_text, is_correct FROM Answers WHERE question_id = ?`,
-        [currentQuestion.id],
-        (err, answers) => {
-          if (err) return console.error(err.message);
-
-          const questionUpdate = {
-            question: {
-              text: currentQuestion.question_text,
-              answers: answers.map(answer => ({
-                id: answer.id,
-                text: answer.answer_text
-              })),
-            },
-            currentPlayer: game.players[game.currentPlayerIndex],
-            timeLeft: parseInt(game.timePerQuestion, 10) / 1000,
-            currentQuestionNumber: game.currentQuestionIndex + 1,
-            totalQuestions: game.questionsPerGame
-          };
-
-          io.to(gameCode).emit('questionUpdate', questionUpdate);
-          startTimer(gameCode);
-        }
-      );
+      io.to(gameCode).emit('questionUpdate', questionUpdate);
+      startTimer(gameCode);
     }
   );
 }
